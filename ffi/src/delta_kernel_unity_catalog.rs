@@ -11,7 +11,7 @@ use delta_kernel_default_engine::DefaultEngine;
 use delta_kernel_ffi::handle::Handle;
 use delta_kernel_ffi::{kernel_string_slice, KernelStringSlice, OptionalValue, TryFromStringSlice};
 use delta_kernel_ffi_macros::handle_descriptor;
-use delta_kernel_unity_catalog::UCCommitter;
+use delta_kernel_unity_catalog::{FileSystemOnlyCatalogManagedCommitter, UCCommitter};
 use tracing::debug;
 use unity_catalog_delta_client_api::{
     Result as ApiResult, TableIdentifier, UpdateTableClient,
@@ -252,7 +252,26 @@ fn get_uc_committer_impl(
     Ok(committer.into())
 }
 
-/// Free a committer obtained via [`get_uc_committer`] that was not passed to a consuming API.
+/// Builds a catalog-managed committer limited to the direct-to-storage version 0 and version 1
+/// create-table bootstrap commits.
+///
+/// # Safety
+///
+/// Caller is responsible for passing a valid error function pointer.
+#[no_mangle]
+pub unsafe extern "C" fn get_filesystem_only_catalog_managed_committer(
+    error_fn: AllocateErrorFn,
+) -> ExternResult<Handle<MutableCommitter>> {
+    get_filesystem_only_catalog_managed_committer_impl().into_extern_result(&error_fn)
+}
+
+fn get_filesystem_only_catalog_managed_committer_impl() -> DeltaResult<Handle<MutableCommitter>> {
+    let committer: Box<dyn Committer> = Box::new(FileSystemOnlyCatalogManagedCommitter::new());
+    Ok(committer.into())
+}
+
+/// Free a committer obtained via [`get_uc_committer`] or
+/// [`get_filesystem_only_catalog_managed_committer`] that was not passed to a consuming API.
 ///
 /// APIs that take ownership of the committer; `transaction_with_committer`,
 /// `create_table_builder_build_with_committer`, and `snapshot_publish_with_committer`
@@ -457,5 +476,12 @@ pub(crate) mod tests {
             free_uc_commit_client(client);
             free_uc_committer(committer);
         }
+    }
+
+    #[test]
+    fn test_get_filesystem_only_catalog_managed_committer() {
+        let committer =
+            unsafe { ok_or_panic(get_filesystem_only_catalog_managed_committer(allocate_err)) };
+        unsafe { free_uc_committer(committer) };
     }
 }

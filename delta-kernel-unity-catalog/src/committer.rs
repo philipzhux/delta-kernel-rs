@@ -294,6 +294,63 @@ impl<C: UpdateTableClient + 'static> Committer for UCCommitter<C> {
     }
 }
 
+/// Catalog-managed committer for direct-to-storage create-table bootstrap commits.
+///
+/// Versions 0 and 1 are written directly to the published log. Later versions require a catalog
+/// committer that ratifies each update.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileSystemOnlyCatalogManagedCommitter;
+
+impl FileSystemOnlyCatalogManagedCommitter {
+    /// Build a create-table bootstrap committer.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Committer for FileSystemOnlyCatalogManagedCommitter {
+    fn commit(
+        &self,
+        engine: &dyn Engine,
+        actions: DeltaResultIterator<'_, FilteredEngineData>,
+        commit_metadata: CommitMetadata,
+    ) -> DeltaResult<CommitResponse> {
+        let version = commit_metadata.version();
+        require!(
+            version <= 1,
+            DeltaError::generic(format!(
+                "bootstrap only supports versions 0 and 1; got {version}"
+            ))
+        );
+        let published_commit_path = commit_metadata.published_commit_path()?;
+        match engine.json_handler().write_json_file(
+            &published_commit_path,
+            Box::new(actions),
+            false,
+        ) {
+            Ok(written_size) => Ok(CommitResponse::Committed {
+                file_meta: FileMeta::new(
+                    published_commit_path,
+                    commit_metadata.in_commit_timestamp(),
+                    written_size,
+                ),
+            }),
+            Err(DeltaError::FileAlreadyExists(_)) => Ok(CommitResponse::Conflict { version }),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn is_catalog_committer(&self) -> bool {
+        true
+    }
+
+    fn publish(&self, _: &dyn Engine, _: PublishMetadata) -> DeltaResult<()> {
+        Err(DeltaError::unsupported(
+            "filesystem-only catalog-managed bootstrap does not publish catalog commits",
+        ))
+    }
+}
+
 /// Convert a `u64` to the `i64` the UC wire types use, erroring if it does not fit.
 fn u64_to_wire_i64(value: u64, field: &str) -> DeltaResult<i64> {
     value
@@ -320,6 +377,7 @@ mod tests {
     use delta_kernel::object_store::local::LocalFileSystem;
     use delta_kernel::{EngineData, FilteredEngineData, Version};
     use delta_kernel_default_engine::DefaultEngine;
+    use rstest::rstest;
     use unity_catalog_delta_client_api::error::Result;
 
     use super::*;
@@ -338,6 +396,39 @@ mod tests {
             "test-table-id",
             TableIdentifier::new("test_catalog", "test_schema", "test_table"),
         )
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(1)]
+    fn filesystem_only_bootstrap_writes_directly(#[case] version: Version) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root, version);
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+        fs::create_dir_all(tmp_dir.path().join("_delta_log")).unwrap();
+
+        FileSystemOnlyCatalogManagedCommitter::new()
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap();
+
+        assert!(tmp_dir
+            .path()
+            .join(format!("_delta_log/{version:020}.json"))
+            .exists());
+    }
+
+    #[test]
+    fn filesystem_only_bootstrap_rejects_later_versions() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_root = url::Url::from_directory_path(tmp_dir.path()).unwrap();
+        let commit_metadata = catalog_managed_commit_metadata(table_root, 2);
+        let engine = DefaultEngine::builder(Arc::new(LocalFileSystem::new())).build();
+
+        let error = FileSystemOnlyCatalogManagedCommitter::new()
+            .commit(&engine, Box::new(std::iter::empty()), commit_metadata)
+            .unwrap_err();
+        assert!(error.to_string().contains("supports versions 0 and 1"));
     }
 
     /// Creates a valid catalog-managed CommitMetadata with all required UC features and properties.

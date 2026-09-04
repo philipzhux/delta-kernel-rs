@@ -125,6 +125,10 @@ Write context: `get_unpartitioned_write_context` covers unpartitioned tables. Fo
 
 Catalog-managed publish flow (after a catalog committer stages commits):
 
+Catalog-managed create bootstrap uses `get_filesystem_only_catalog_managed_committer` for the
+direct-to-storage version 0 and version 1 commits. After catalog registration, use
+`get_uc_committer` for every subsequent commit.
+
 ```
 committed_transaction_post_commit_snapshot()
   -> snapshot_publish_with_committer(snapshot, committer, engine)

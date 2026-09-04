@@ -5,7 +5,7 @@ mod constants;
 mod errors;
 mod utils;
 
-pub use committer::UCCommitter;
+pub use committer::{FileSystemOnlyCatalogManagedCommitter, UCCommitter};
 use delta_kernel::snapshot::SnapshotBuilder;
 use delta_kernel::{DeltaResult, Error, LogPath, Snapshot};
 use unity_catalog_delta_client_api::{Commit, LoadTableResponse};

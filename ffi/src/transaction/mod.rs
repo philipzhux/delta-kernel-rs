@@ -277,6 +277,33 @@ fn with_domain_metadata_removed_impl(
     Ok(Box::new(txn.with_domain_metadata_removed(domain)).into())
 }
 
+/// Set the row-tracking high-water mark for content committed outside the kernel's add-file path.
+///
+/// This is intentionally narrower than [`with_domain_metadata`]: callers cannot use the public
+/// domain-metadata API to modify `delta.rowTracking` or any other system-controlled domain.
+///
+/// # Safety
+///
+/// Caller is responsible for passing valid handles. CONSUMES the transaction handle and returns
+/// a new one.
+#[no_mangle]
+pub unsafe extern "C" fn with_row_tracking_high_water_mark(
+    txn: Handle<ExclusiveTransaction>,
+    high_water_mark: i64,
+    engine: Handle<SharedExternEngine>,
+) -> ExternResult<Handle<ExclusiveTransaction>> {
+    let txn = unsafe { txn.into_inner() };
+    let engine = unsafe { engine.as_ref() };
+    with_row_tracking_high_water_mark_impl(*txn, high_water_mark).into_extern_result(&engine)
+}
+
+fn with_row_tracking_high_water_mark_impl(
+    txn: Transaction,
+    high_water_mark: i64,
+) -> DeltaResult<Handle<ExclusiveTransaction>> {
+    Ok(Box::new(txn.with_row_tracking_high_water_mark(high_water_mark)?).into())
+}
+
 /// Commits `file` as this transaction's root manifest.
 ///
 /// # Safety
@@ -1684,6 +1711,73 @@ mod tests {
             result,
             KernelError::GenericError,
             Some("Generic delta kernel error: Cannot modify domains that start with 'delta.' as those are system controlled"),
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_requires_row_tracking_feature(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (table_url, _store, engine) =
+            setup_domain_metadata_table("test_row_tracking_hwm_feature").await?;
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        assert_extern_result_error_with_message(
+            unsafe { commit(txn, engine.shallow_copy()) },
+            KernelError::GenericError,
+            Some(
+                "Generic delta kernel error: System domain 'delta.rowTracking' requires the \
+                 'rowTracking' feature to be enabled",
+            ),
+        );
+
+        unsafe { free_engine(engine) };
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_row_tracking_high_water_mark_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let (store, _test_engine, table_url) =
+            test_utils::engine_store_setup("test_row_tracking_hwm", None);
+        let schema = schema_ref! { nullable "id": INTEGER };
+        test_utils::create_table(
+            store.clone(),
+            table_url.clone(),
+            schema,
+            &[],
+            true,
+            vec![],
+            vec!["rowTracking", "domainMetadata"],
+        )
+        .await?;
+
+        let engine = engine_handle_for_store(Arc::clone(&store));
+        let table_path = table_url.as_str();
+        let txn = ok_or_panic(unsafe {
+            transaction(kernel_string_slice!(table_path), engine.shallow_copy())
+        });
+        let txn = ok_or_panic(unsafe {
+            with_row_tracking_high_water_mark(txn, 7, engine.shallow_copy())
+        });
+
+        let committed = ok_or_panic(unsafe { commit(txn, engine.shallow_copy()) });
+        assert_eq!(unsafe { version_and_free(committed) }, 1);
+        let row_tracking = read_domain_metadata_action(&store, &table_url, 1).await;
+        assert_eq!(
+            row_tracking["domainMetadata"]["domain"],
+            "delta.rowTracking"
+        );
+        assert_eq!(
+            row_tracking["domainMetadata"]["configuration"],
+            r#"{"rowIdHighWaterMark":7}"#
         );
 
         unsafe { free_engine(engine) };

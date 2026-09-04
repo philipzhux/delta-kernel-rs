@@ -237,10 +237,10 @@ pub struct Transaction<S = ExistingTable> {
     commit_timestamp: i64,
     // User-provided domain metadata additions (via with_domain_metadata API).
     user_domain_metadata_additions: Vec<DomainMetadata>,
-    // System-generated domain metadata (from transforms, e.g., clustering).
-    // TODO(#1779): Currently only populated during CREATE TABLE. For inserts, row tracking
-    // domain metadata is handled separately via `row_tracking_high_watermark` parameter in
-    // `generate_domain_metadata_actions`. Consider unifying system domain handling.
+    // System-generated domain metadata (from transforms, e.g., clustering) and semantic
+    // connector inputs such as an explicit row-tracking high-water mark for external content.
+    // Kernel-derived row tracking for add files is still passed separately to
+    // `generate_domain_metadata_actions`.
     system_domain_metadata_additions: Vec<DomainMetadata>,
     // Domain names to remove in this transaction. The configuration values are fetched during
     // commit from the log to preserve the pre-image in tombstones.
@@ -686,6 +686,23 @@ impl<S> Transaction<S> {
         self.user_domain_metadata_additions
             .push(DomainMetadata::new(domain, configuration));
         self
+    }
+
+    /// Set the row-tracking high-water mark for content committed outside the kernel's add-file
+    /// path.
+    ///
+    /// This is a dedicated system-domain operation: callers cannot use
+    /// [`Self::with_domain_metadata`] to modify `delta.rowTracking` or any other `delta.*`
+    /// domain. The transaction validates the row-tracking and domain-metadata table features at
+    /// commit time.
+    #[internal_api]
+    pub(crate) fn with_row_tracking_high_water_mark(
+        mut self,
+        high_water_mark: i64,
+    ) -> DeltaResult<Self> {
+        self.system_domain_metadata_additions
+            .push(RowTrackingDomainMetadata::new(high_water_mark).try_into()?);
+        Ok(self)
     }
 
     /// Determines the commit type based on whether this is a create-table operation and whether

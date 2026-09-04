@@ -723,6 +723,11 @@ fn store_with_strip_prefix(server: &MockServer, prefix: &str) -> RestObjectStore
     )
 }
 
+fn store_with_logical_root(server: &MockServer) -> RestObjectStore {
+    store_with_strip_prefix(server, "/TablesById/u")
+        .with_logical_root(Path::from("Volumes/catalog/schema/table"))
+}
+
 #[tokio::test]
 async fn list_strips_entry_prefix() {
     let server = MockServer::start().await;
@@ -760,6 +765,161 @@ async fn list_rejects_entry_outside_strip_prefix() {
     let results: Vec<_> = store.list(Some(&Path::from("d"))).collect::<Vec<_>>().await;
     assert!(matches!(
         results.as_slice(),
+        [Err(ObjectStoreError::Generic { .. })]
+    ));
+}
+
+#[tokio::test]
+async fn logical_root_maps_file_requests_to_transport_relative_paths() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files/_delta_log/000.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"commit".as_slice()))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/files/_delta_log/001.json"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/files/_delta_log/002.json"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let store = store_with_logical_root(&server);
+    let bytes = store
+        .get(&Path::from(
+            "Volumes/catalog/schema/table/_delta_log/000.json",
+        ))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"commit");
+    store
+        .put(
+            &Path::from("Volumes/catalog/schema/table/_delta_log/001.json"),
+            PutPayload::from_static(b"next"),
+        )
+        .await
+        .unwrap();
+    store
+        .delete(&Path::from(
+            "Volumes/catalog/schema/table/_delta_log/002.json",
+        ))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn logical_root_maps_verified_create_read_back() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/files/_delta_log/001.json"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/files/_delta_log/001.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"next".as_slice()))
+        .mount(&server)
+        .await;
+
+    store_with_logical_root(&server)
+        .with_verify_on_ambiguous(true)
+        .put_opts(
+            &Path::from("Volumes/catalog/schema/table/_delta_log/001.json"),
+            PutPayload::from_static(b"next"),
+            PutOptions {
+                mode: PutMode::Create,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn logical_root_restores_list_locations_and_maps_offset() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dirs/_delta_log"))
+        .and(wiremock::matchers::query_param("start_from", "001.json"))
+        .and(wiremock::matchers::query_param_is_missing("recursive"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"contents":[{"path":"/TablesById/u/_delta_log/001.json","file_size":1},{"path":"/TablesById/u/_delta_log/002.json","file_size":2}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let store = store_with_logical_root(&server);
+    let prefix = Path::from("Volumes/catalog/schema/table/_delta_log");
+    let offset = Path::from("Volumes/catalog/schema/table/_delta_log/001.json");
+    let locations: Vec<_> = store
+        .list_with_offset(Some(&prefix), &offset)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|result| result.unwrap().location)
+        .collect();
+    assert_eq!(
+        locations,
+        vec![Path::from(
+            "Volumes/catalog/schema/table/_delta_log/002.json"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn logical_root_restores_recursive_list_locations() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/dirs/_delta_log"))
+        .and(wiremock::matchers::query_param("recursive", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"contents":[{"path":"/TablesById/u/_delta_log/001.json","file_size":1}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let store = store_with_logical_root(&server);
+    let locations: Vec<_> = store
+        .list(Some(&Path::from("Volumes/catalog/schema/table/_delta_log")))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(|result| result.unwrap().location)
+        .collect();
+    assert_eq!(
+        locations,
+        vec![Path::from(
+            "Volumes/catalog/schema/table/_delta_log/001.json"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn logical_root_rejects_paths_outside_its_scope() {
+    let server = MockServer::start().await;
+    let store = store_with_logical_root(&server);
+
+    let get_error = store
+        .get(&Path::from(
+            "Volumes/other/schema/table/_delta_log/000.json",
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(get_error, ObjectStoreError::Generic { .. }));
+
+    let list_results = store
+        .list(Some(&Path::from("Volumes/other/schema/table/_delta_log")))
+        .collect::<Vec<_>>()
+        .await;
+    assert!(matches!(
+        list_results.as_slice(),
         [Err(ObjectStoreError::Generic { .. })]
     ));
 }

@@ -1,8 +1,9 @@
 //! REST [`RestObjectStore`] wiring for [`EngineBuilder`](crate::EngineBuilder).
 //!
 //! Call [`set_builder_rest_object_store`](crate::set_builder_rest_object_store) with a
-//! [`CRestEndpointConfig`] to select the REST backend. The builder `url` must be the REST service
-//! base URL, not a Delta table path.
+//! [`CRestEndpointConfig`] to select the REST backend. By default, the builder `url` is the REST
+//! service base URL. Set [`REST_BUILDER_OPTION_TRANSPORT_BASE_URL`] when the builder `url` is a
+//! logical table root and HTTP requests use a different endpoint.
 //!
 //! TLS, retries, and static auth use [`set_builder_option`](crate::set_builder_option) with the
 //! `REST_BUILDER_OPTION_*` keys below. Pass a [`CAuthHeaderCallback`] when headers expire; with
@@ -15,6 +16,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use delta_kernel::object_store::path::Path;
 use delta_kernel::object_store::{Error as ObjectStoreError, ObjectStore};
 use delta_kernel::{DeltaResult, Error};
 use delta_kernel_default_engine::rest_store::{
@@ -43,6 +45,15 @@ pub const AUTH_MAX_NUM_HEADERS: usize = 8;
 pub const REST_BUILDER_OPTION_HEADER_PREFIX: &str = "header.";
 #[no_mangle]
 pub static REST_BUILDER_OPTION_HEADER_PREFIX_KEY: [u8; 8] = *b"header.\0";
+
+/// REST service base URL when the engine builder URL is the logical table root.
+///
+/// When unset, the builder URL remains the REST service base URL and object paths are passed
+/// through unchanged. When set, request paths must be beneath the builder URL's path; that prefix
+/// is removed from HTTP requests and restored on list results.
+pub const REST_BUILDER_OPTION_TRANSPORT_BASE_URL: &str = "transport.base_url";
+#[no_mangle]
+pub static REST_BUILDER_OPTION_TRANSPORT_BASE_URL_KEY: [u8; 19] = *b"transport.base_url\0";
 
 /// PEM client-certificate path. mTLS is enabled only when cert, key, and CA paths are all set.
 pub const REST_BUILDER_OPTION_TLS_CERT_PATH: &str = "tls.cert_path";
@@ -285,11 +296,19 @@ fn copy_required_string(slice: &KernelStringSlice, field: &str) -> DeltaResult<S
 
 /// Build a [`RestObjectStore`] from an engine builder's URL, options, and REST state.
 pub(crate) fn build_rest_object_store(
-    base_url: &Url,
+    builder_url: &Url,
     options: &HashMap<String, String>,
     rest: &RestBuilderState,
 ) -> DeltaResult<Arc<dyn ObjectStore>> {
     let config = rest.endpoint_config.clone();
+    let (transport_base_url, logical_root) =
+        match options.get(REST_BUILDER_OPTION_TRANSPORT_BASE_URL) {
+            Some(transport_base_url) => (
+                Url::parse(transport_base_url)?.to_string(),
+                Some(Path::from_url_path(builder_url.path())?),
+            ),
+            None => (builder_url.to_string(), None),
+        };
 
     let auth: Arc<dyn AuthHeaderProvider> = match rest.auth_callback {
         Some(cb) => {
@@ -351,11 +370,14 @@ pub(crate) fn build_rest_object_store(
     // initializes a crypto provider, which is minutes of work under the Miri interpreter.
     let client = build_rest_client(&tls)?;
 
-    Ok(Arc::new(
-        RestObjectStore::new(base_url.to_string(), client, auth, Arc::new(config))
-            .with_max_retries(max_retries)
-            .with_verify_on_ambiguous(verify),
-    ))
+    let store = RestObjectStore::new(transport_base_url, client, auth, Arc::new(config))
+        .with_max_retries(max_retries)
+        .with_verify_on_ambiguous(verify);
+    let store = match logical_root {
+        Some(logical_root) => store.with_logical_root(logical_root),
+        None => store,
+    };
+    Ok(Arc::new(store))
 }
 
 fn parse_bool_option(key: &str, value: Option<&String>) -> DeltaResult<bool> {
@@ -467,6 +489,10 @@ mod tests {
         option_key_bytes_match_const(
             &REST_BUILDER_OPTION_HEADER_PREFIX_KEY,
             REST_BUILDER_OPTION_HEADER_PREFIX,
+        );
+        option_key_bytes_match_const(
+            &REST_BUILDER_OPTION_TRANSPORT_BASE_URL_KEY,
+            REST_BUILDER_OPTION_TRANSPORT_BASE_URL,
         );
         option_key_bytes_match_const(
             &REST_BUILDER_OPTION_TLS_CERT_PATH_KEY,
@@ -603,6 +629,19 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_invalid_transport_base_url() {
+        let mut options = HashMap::new();
+        options.insert(
+            REST_BUILDER_OPTION_TRANSPORT_BASE_URL.into(),
+            "not a URL".into(),
+        );
+        assert!(
+            build_rest_object_store(&test_base_url(), &options, &test_rest_builder_state())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn build_rejects_invalid_header_value() {
         let mut options = HashMap::new();
         options.insert(
@@ -714,6 +753,10 @@ mod tests {
         options.insert(
             REST_BUILDER_OPTION_PUT_VERIFY_ON_AMBIGUOUS.into(),
             "true".into(),
+        );
+        options.insert(
+            REST_BUILDER_OPTION_TRANSPORT_BASE_URL.into(),
+            "https://localhost:8080/api/2.0/fs".into(),
         );
         assert!(build_rest_object_store(&test_base_url(), &options, &rest).is_ok());
     }

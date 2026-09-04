@@ -33,6 +33,7 @@ pub struct RestObjectStore {
     client: Client,
     auth: Arc<dyn AuthHeaderProvider>,
     config: Arc<RestEndpointConfig>,
+    logical_root: Option<Path>,
     /// Retries (beyond the first attempt) for transient failures on idempotent requests. 0
     /// disables.
     max_retries: u32,
@@ -61,9 +62,17 @@ impl RestObjectStore {
             client,
             auth,
             config,
+            logical_root: None,
             max_retries: 0,
             verify_on_ambiguous: false,
         }
+    }
+
+    /// Translate object paths beneath `logical_root` to paths relative to the REST endpoint.
+    /// List results are translated back beneath the same root.
+    pub fn with_logical_root(mut self, logical_root: Path) -> Self {
+        self.logical_root = Some(logical_root);
+        self
     }
 
     /// Retry transient failures (5xx, connect/timeout) on idempotent requests up to `n` times.
@@ -81,6 +90,26 @@ impl RestObjectStore {
     /// Fetch the current auth headers from the provider.
     fn headers(&self) -> ObjectStoreResult<HeaderMap> {
         self.auth.headers()
+    }
+
+    fn transport_path(&self, path: &Path) -> ObjectStoreResult<Path> {
+        let Some(root) = &self.logical_root else {
+            return Ok(path.clone());
+        };
+        path.prefix_match(root).map(Path::from_iter).ok_or_else(|| {
+            generic_error(format!(
+                "object path `{path}` is outside the configured logical root `{root}`"
+            ))
+        })
+    }
+
+    fn restore_logical_path(&self, path: &Path) -> Path {
+        let Some(root) = &self.logical_root else {
+            return path.clone();
+        };
+        let mut logical_path = root.clone();
+        logical_path.extend(path.parts());
+        logical_path
     }
 
     /// Send an idempotent request, retrying transient failures (5xx, connect/timeout) up to
@@ -141,11 +170,12 @@ impl RestObjectStore {
     /// writer-unique content -- so a byte-for-byte match implies we wrote it, not a competitor.
     async fn put_create_verified(
         &self,
-        path: &str,
+        path: &Path,
         url: &str,
         query: &[(String, String)],
         body: Bytes,
     ) -> ObjectStoreResult<PutResult> {
+        let path_str = path.as_ref();
         let mut retries = 0u32;
         let mut last_failure = None::<RetryFailure>;
         loop {
@@ -158,14 +188,14 @@ impl RestObjectStore {
                     .body(body.clone())
                     .send()
                     .await,
-                path,
+                path_str,
                 retries,
             )?;
 
             match disposition {
                 PutCreateDisposition::Success => {
                     if let Some(failure) = last_failure.as_ref().filter(|_| retries > 0) {
-                        log_retry_outcome(path, retries, failure, true);
+                        log_retry_outcome(path_str, retries, failure, true);
                     }
                     return Ok(put_result());
                 }
@@ -179,13 +209,13 @@ impl RestObjectStore {
             match self.read_back(path, &body).await {
                 Ok(WriteState::Matches) => {
                     if let Some(failure) = last_failure.as_ref().filter(|_| retries > 0) {
-                        log_retry_outcome(path, retries, failure, true);
+                        log_retry_outcome(path_str, retries, failure, true);
                     }
                     return Ok(put_result());
                 }
                 Ok(WriteState::Differs) => {
                     return Err(ObjectStoreError::AlreadyExists {
-                        path: path.to_string(),
+                        path: path_str.to_string(),
                         source: "verified conflicting write".into(),
                     })
                 }
@@ -193,7 +223,7 @@ impl RestObjectStore {
                 Err(e) if retries >= self.max_retries => {
                     let transport_failure = RetryFailure::Transport(e.to_string());
                     let failure = last_failure.as_ref().unwrap_or(&transport_failure);
-                    log_retry_outcome(path, retries, failure, false);
+                    log_retry_outcome(path_str, retries, failure, false);
                     return Err(e);
                 }
                 Err(e) => {
@@ -202,10 +232,10 @@ impl RestObjectStore {
             }
             if retries >= self.max_retries {
                 if let Some(failure) = &last_failure {
-                    log_retry_outcome(path, retries, failure, false);
+                    log_retry_outcome(path_str, retries, failure, false);
                 }
                 return Err(generic_error(format!(
-                    "exceeded max retries ({}) during put for `{path}` without confirming the write landed",
+                    "exceeded max retries ({}) during put for `{path_str}` without confirming the write landed",
                     self.max_retries
                 )));
             }
@@ -215,7 +245,7 @@ impl RestObjectStore {
     }
 
     /// Read `path` back and compare its bytes with `expected`.
-    async fn read_back(&self, path: &str, expected: &Bytes) -> ObjectStoreResult<WriteState> {
+    async fn read_back(&self, path: &Path, expected: &Bytes) -> ObjectStoreResult<WriteState> {
         match self.get_file(path, None).await {
             Ok((bytes, _, _)) if bytes == *expected => Ok(WriteState::Matches),
             Ok(_) => Ok(WriteState::Differs),
@@ -227,7 +257,8 @@ impl RestObjectStore {
     /// Delete a single object via HTTP `DELETE`. DELETE is idempotent, so transient failures are
     /// retried via [`Self::send_idempotent`].
     async fn delete_one(&self, location: &Path) -> ObjectStoreResult<()> {
-        let path = location.as_ref();
+        let transport_path = self.transport_path(location)?;
+        let path = transport_path.as_ref();
         let url = self.config.file_url(&self.base_url, path);
         let response = self
             .send_idempotent(path, |c, h| c.delete(&url).headers(h))
@@ -241,9 +272,11 @@ impl RestObjectStore {
     /// full-body `200`.
     async fn get_file(
         &self,
-        path: &str,
+        location: &Path,
         range_header: Option<&str>,
     ) -> ObjectStoreResult<(Bytes, HeaderMap, reqwest::StatusCode)> {
+        let transport_path = self.transport_path(location)?;
+        let path = transport_path.as_ref();
         let url = self.config.file_url(&self.base_url, path);
         let range = range_header
             .map(reqwest::header::HeaderValue::from_str)
@@ -267,7 +300,10 @@ impl RestObjectStore {
     /// Issue an HTTP `HEAD` and build [`ObjectMeta`] from the response headers, without
     /// downloading the body. Used to serve `get_opts(head = true)` / `head()`.
     async fn head_meta(&self, path: &str, location: &Path) -> ObjectStoreResult<ObjectMeta> {
-        let url = self.config.file_url(&self.base_url, path);
+        let transport_path = self.transport_path(location)?;
+        let url = self
+            .config
+            .file_url(&self.base_url, transport_path.as_ref());
         let response = self
             .send_idempotent(path, |c, h| c.head(&url).headers(h))
             .await?;
@@ -356,7 +392,8 @@ impl RestObjectStore {
                     Ok(p) => p,
                     Err(e) => { yield Err(e); break; }
                 };
-                for meta in page.objects {
+                for mut meta in page.objects {
+                    meta.location = store.restore_logical_path(&meta.location);
                     // Enforce the exclusive-offset contract client-side.
                     if let Some(off) = &exclusive_offset {
                         if meta.location <= *off {
@@ -509,7 +546,7 @@ impl ObjectStore for RestObjectStore {
         }
 
         let range_header = options.range.as_ref().map(get_range_to_header);
-        let (content, headers, status) = self.get_file(path_str, range_header.as_deref()).await?;
+        let (content, headers, status) = self.get_file(location, range_header.as_deref()).await?;
 
         let (range, total_size) = if let Some(requested) = &options.range {
             // A ranged request that comes back non-partial (a 200 with the full body) must not be
@@ -587,13 +624,16 @@ impl ObjectStore for RestObjectStore {
             PutMode::Update(_) => return Err(not_supported("PutMode::Update")),
         };
         let path_str = location.as_ref();
-        let url = self.config.file_url(&self.base_url, path_str);
+        let transport_path = self.transport_path(location)?;
+        let url = self
+            .config
+            .file_url(&self.base_url, transport_path.as_ref());
         let query = self.config.put_query(overwrite);
         let body: Bytes = payload.into();
         // A non-idempotent PUT is only safe to retry when we can verify the write landed, so the
         // verify path is gated on `Create` + verification enabled.
         if !overwrite && self.verify_on_ambiguous {
-            return self.put_create_verified(path_str, &url, &query, body).await;
+            return self.put_create_verified(location, &url, &query, body).await;
         }
         let response = self
             .client
@@ -609,8 +649,14 @@ impl ObjectStore for RestObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        let prefix = prefix.map(|p| p.as_ref().to_string()).unwrap_or_default();
-        self.list_paginated(prefix, None, None, true)
+        let prefix = prefix
+            .cloned()
+            .or_else(|| self.logical_root.clone())
+            .unwrap_or_default();
+        match self.transport_path(&prefix) {
+            Ok(prefix) => self.list_paginated(prefix.to_string(), None, None, true),
+            Err(error) => Box::pin(futures::stream::once(futures::future::ready(Err(error)))),
+        }
     }
 
     fn list_with_offset(
@@ -618,12 +664,27 @@ impl ObjectStore for RestObjectStore {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        let prefix = prefix.map(|p| p.as_ref().to_string()).unwrap_or_default();
+        let logical_prefix = prefix
+            .cloned()
+            .or_else(|| self.logical_root.clone())
+            .unwrap_or_default();
+        let prefix = match self.transport_path(&logical_prefix) {
+            Ok(prefix) => prefix.to_string(),
+            Err(error) => {
+                return Box::pin(futures::stream::once(futures::future::ready(Err(error))))
+            }
+        };
+        let transport_offset = match self.transport_path(offset) {
+            Ok(offset) => offset,
+            Err(error) => {
+                return Box::pin(futures::stream::once(futures::future::ready(Err(error))))
+            }
+        };
         // `offset` is a full path beginning with `prefix`; the REST list offset is relative to
         // the directory being listed, so send only the leaf portion. The full `offset` is kept
         // to enforce exclusivity client-side.
         let offset_str = {
-            let raw = offset.as_ref();
+            let raw = transport_offset.as_ref();
             if !prefix.is_empty() && raw.starts_with(&prefix) {
                 raw[prefix.len()..].trim_start_matches('/').to_string()
             } else {

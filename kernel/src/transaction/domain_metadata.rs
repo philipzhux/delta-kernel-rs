@@ -198,6 +198,17 @@ impl<S> Transaction<S> {
         // Validate domain operations (includes feature validation)
         self.validate_domain_metadata_operations()?;
 
+        if row_tracking_high_watermark.is_some()
+            && self
+                .system_domain_metadata_additions
+                .iter()
+                .any(|metadata| metadata.domain() == ROW_TRACKING_DOMAIN_NAME)
+        {
+            return Err(Error::generic(
+                "Cannot set the row-tracking high-water mark explicitly when the kernel derives it from added files",
+            ));
+        }
+
         if is_create {
             // user_domain_removals already validated above, but be explicit
             debug_assert!(self.user_domain_removals.is_empty());
